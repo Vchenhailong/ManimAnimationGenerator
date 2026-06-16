@@ -1,3 +1,5 @@
+<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/19336ef0-f97c-47f8-98dc-f367d0f7e236" />
+
 # ManimAnimationGenerator 技能包
 
 > 数学/物理知识动画生成专用 Manim 脚手架，遵循「七阶段教学路径」「排版布局绝对红线」「语义相关性唯一基准」三大核心原则。
