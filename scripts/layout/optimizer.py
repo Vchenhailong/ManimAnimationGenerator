@@ -21,10 +21,56 @@ import logging
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
-from manim import Mobject, VGroup, Text, MathTex, DOWN
+from manim import Mobject, VGroup, Text, MathTex, Tex, TexTemplate, DOWN
 
 from scripts.layout.engine import LayoutEngine
 from scripts.layout.constants import ZoneConstants
+
+
+# ============================================================
+# minipage 路径：em 宽度探针缓存
+# ============================================================
+#
+# 1em 在不同字号下的 Manim 实际宽度不同。
+# 用 Tex(r"\rule{1em}{0.5em}", font_size=N) 测一次即可。
+# 同一 (manim_width, font_size) 组合的探测结果可复用。
+#
+# cache key: (manim_width, font_size)
+# cache val: em 数量 (float)
+_EM_WIDTH_CACHE: Dict[Tuple[float, int], float] = {}
+
+
+# 跨调用复用的 xelatex + xeCJK 模板（避免每次重建）
+_XELATEX_TEMPLATE_CACHE: Optional[TexTemplate] = None
+
+
+def _get_xelatex_template() -> TexTemplate:
+    """获取 xelatex + xeCJK 模板（带中文字体）
+
+    缓存为模块级单例，避免每次 wrap 都重建。
+    字体优先级：Microsoft YaHei > Noto Sans CJK SC
+
+    ⚠ 一致性约束（修复 P-缩放冲突-字体）：
+    - 不加 [Scale=X]：CJK 字体必须按 font_size 100% 渲染
+    - 若加 [Scale=0.92]，CJK 字符有效尺寸 = font_size × 0.92 < Pango 路径
+    - 这会导致 minipage 路径比 Pango 兜底路径"看起来字体更小"，违反一致性
+    - 字号与栏宽的协调由 _compute_em_width 负责，字体本身不缩放
+    """
+    global _XELATEX_TEMPLATE_CACHE
+    if _XELATEX_TEMPLATE_CACHE is not None:
+        return _XELATEX_TEMPLATE_CACHE
+    template = TexTemplate(tex_compiler="xelatex")
+    # 不加 [Scale=X]：CJK 字符渲染尺寸严格等于 font_size，与 Pango 一致
+    template.preamble = (
+        r"\usepackage{xeCJK}"
+        "\n"
+        r"\setCJKmainfont{Microsoft YaHei}"
+        "\n"
+        r"\setCJKsansfont{Noto Sans CJK SC}"
+        "\n"
+    )
+    _XELATEX_TEMPLATE_CACHE = template
+    return template
 
 
 @dataclass
@@ -290,13 +336,19 @@ class LayoutOptimizer:
         对过宽的 Text/MathTex 对象按可用栏宽截断并重建为多行对象。
 
         处理逻辑：
-        - Text 对象：按中文字符宽度估算，在合适位置插入换行符后重建
+        - Text 对象：minipage 路径（xelatex）→ 失败回退到 Pango 路径
         - MathTex 对象：对长公式字符串按字符数阈值拆分，用 \\\\ 插入换行
         - 非文本类 Mobject：跳过（缩放或拆分处理）
 
+        与栏位缩放的一致性保证（修复 P-缩放冲突）：
+        - 换行目标是 column_width（与 place_*_column 内部 scale 算式用同一常量）
+        - 换行后内容 width ≤ target * 0.95，place_*_column 再算 scale_factor ≥ 1.0
+        - 因此栏位缩放对换行后的内容不再触发，避免双重缩放
+        - 若调用方传 use_minipage=False，强制走 Pango 路径
+
         Args:
             mobjects: Mobject 列表
-            violation: 违规信息（含 column_width 等布局上下文）
+            violation: 违规信息，含 column_width / use_minipage
 
         Returns:
             是否成功应用了至少一次换行
@@ -310,10 +362,29 @@ class LayoutOptimizer:
                 - ZoneConstants.MAIN_CONTENT_SINGLE_COL_X_MIN
             )
 
+        # 是否走 minipage 路径：默认通过 LayoutScene.is_minipage_available()
+        # 决定；调用方可传 use_minipage=False 强制 Pango
+        use_minipage = violation.get("use_minipage", None)
+        if use_minipage is None:
+            try:
+                # 延迟导入避免循环依赖
+                from scripts.layout.scene_base import LayoutScene
+
+                use_minipage = LayoutScene.is_minipage_available()
+            except Exception:
+                use_minipage = False
+
         wrapped_count = 0
         for i, mobj in enumerate(mobjects):
             if isinstance(mobj, Text):
-                wrapped = self._wrap_text_object(mobj, target_width)
+                if use_minipage:
+                    # 先试 minipage（LaTeX 高质量断行）
+                    wrapped = _wrap_text_with_minipage(mobj, target_width)
+                    if not wrapped:
+                        # 失败回退到 Pango 路径
+                        wrapped = self._wrap_text_object(mobj, target_width)
+                else:
+                    wrapped = self._wrap_text_object(mobj, target_width)
                 if wrapped:
                     wrapped_count += 1
             elif isinstance(mobj, MathTex):
@@ -508,6 +579,189 @@ class LayoutOptimizer:
             lines.append(remaining)
 
         return lines
+
+
+# ============================================================
+# minipage 路径（complementary to _wrap_text_object）
+# ============================================================
+
+
+def _compute_em_width(manim_width: float, font_size: int) -> float:
+    """将 Manim 坐标宽度换算为 LaTeX em 数量
+
+    设计依据：
+    - 1em 在 LaTeX 中 = 当前字号下大写 M 的宽度
+    - Manim Tex 渲染的 1em 在 Manim 坐标系中的实际宽度需实测
+    - 探测方法：渲染 \\rule{1em}{0.5em}（一个 1em 宽 0.5em 高的实心矩形）
+    - 探测结果与 font_size 强相关，缓存复用
+
+    Args:
+        manim_width: 目标 Manim 坐标宽度
+        font_size: Tex 字号（pt），与目标内容一致
+
+    Returns:
+        em 数量（float），如 22.5 表示 minipage 应设 22.5em
+    """
+    cache_key = (round(manim_width, 3), int(font_size))
+    if cache_key in _EM_WIDTH_CACHE:
+        return _EM_WIDTH_CACHE[cache_key]
+
+    try:
+        from manim import Tex as _TexProbe
+
+        probe = _TexProbe(r"\rule{1em}{0.5em}", font_size=font_size)
+        em_in_manim = probe.width
+        if em_in_manim <= 0:
+            raise ValueError("probe width non-positive")
+    except Exception:
+        # 经验回退：em 宽度 ≈ font_size / 50 Manim 单位
+        # 依据：10pt 下 1em≈0.139 英寸，Manim 1 单位≈1 英寸时的常见比例
+        em_in_manim = max(font_size / 50.0, 0.05)
+
+    em_count = manim_width / em_in_manim
+    # 留 2% 余量，避免 LaTeX 测量与 Manim 测量有微差
+    em_count *= 0.98
+    _EM_WIDTH_CACHE[cache_key] = em_count
+    return em_count
+
+
+# LaTeX 特殊字符转义表（仅处理 minipage 文本需要转义的）
+_LATEX_SPECIAL_ESCAPES = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "{": r"\{",
+    "}": r"\}",
+    "^": r"\textasciicircum{}",
+    "~": r"\textasciitilde{}",
+}
+
+
+def _escape_text_for_latex(text: str) -> str:
+    """转义 LaTeX 特殊字符
+
+    Args:
+        text: 原始中文文本（通常无特殊字符，但用户输入可能含）
+
+    Returns:
+        转义后的 LaTeX 安全字符串
+    """
+    result = []
+    for ch in text:
+        if ch in _LATEX_SPECIAL_ESCAPES:
+            result.append(_LATEX_SPECIAL_ESCAPES[ch])
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+def _wrap_text_with_minipage(
+    text_obj: Text,
+    target_manim_width: float,
+) -> bool:
+    """minipage 路径换行（complementary to _wrap_text_object）
+
+    与 _wrap_text_object 的对比：
+    - _wrap_text_object：按字符数估算断行，重建为多行 Text（Pango 渲染）
+    - _wrap_text_with_minipage：构建 minipage 交给 LaTeX 处理断行（xelatex 渲染）
+    - 优先用 _wrap_text_object（快、无 TeX 编译开销）
+    - 仅当 LayoutScene.is_minipage_available() == True 时使用本函数
+
+    工作流程：
+    1. 实测目标 Manim 宽度对应的 em 数（探针缓存）
+    2. 构建 LaTeX：\\begin{minipage}[t]{Xem}\\raggedright <text>\\end{minipage}
+    3. 渲染为 Tex 对象（使用 xelatex + xeCJK 模板）
+    4. 颜色保持（同 _wrap_text_object 的 _force_fill 兜底）
+    5. text_obj.become(new_tex)
+
+    Args:
+        text_obj: 待处理的 Text 对象
+        target_manim_width: 目标 Manim 坐标宽度（如 ZoneConstants 计算出的栏宽）
+
+    Returns:
+        是否成功执行换行重建
+    """
+    try:
+        original_text = text_obj.plaintext
+    except AttributeError:
+        original_text = str(text_obj.text)
+
+    if not original_text:
+        return False
+    if text_obj.width <= target_manim_width * 0.95:
+        return False
+
+    font_size = getattr(text_obj, "font_size", 30)
+
+    # 解析原 color（子对象优先，修复 P0-左栏消失）
+    original_color = text_obj.color if hasattr(text_obj, "color") else None
+    if text_obj.submobjects:
+        try:
+            sub_fill = text_obj.submobjects[0].get_fill_color()
+            if sub_fill is not None:
+                original_color = sub_fill
+        except Exception:
+            pass
+
+    # 步骤 1: 算 em 宽度
+    em_w = _compute_em_width(target_manim_width * 0.95, font_size)
+
+    # 步骤 2: 转义 + 构建 LaTeX
+    safe_text = _escape_text_for_latex(original_text)
+    latex_src = (
+        rf"\begin{{minipage}}[t]{{{em_w:.3f}em}}"
+        rf"\raggedright "
+        rf"{safe_text}"
+        rf"\end{{minipage}}"
+    )
+
+    # 步骤 3: 渲染
+    try:
+        new_text = Tex(
+            latex_src,
+            font_size=font_size,
+            color=original_color,
+            tex_template=_get_xelatex_template(),
+        )
+    except Exception as e:
+        logging.warning(f"[_wrap_text_with_minipage] xelatex 渲染失败: {e}")
+        return False
+
+    # 步骤 3.5: 一致性检查（修复 P-缩放冲突-字体）
+    # 渲染后 Tex 的 font_size 必须 ≥ 原值（不允许被 _get_xelatex_template 缩放）
+    actual_font_size = getattr(new_text, "font_size", font_size)
+    if actual_font_size < font_size * 0.99:
+        logging.warning(
+            f"[_wrap_text_with_minipage] 渲染后字号 {actual_font_size} "
+            f"< 期望 {font_size}，疑似模板缩放"
+        )
+        return False  # 回退到 Pango 路径
+
+    # 步骤 4: 颜色兜底
+    if original_color is not None:
+        try:
+            new_text.set_color(original_color)
+        except Exception:
+            pass
+
+        def _force_fill(mob, color):
+            if hasattr(mob, "set_fill"):
+                try:
+                    mob.set_fill(color, opacity=1.0)
+                except Exception:
+                    pass
+            if hasattr(mob, "submobjects") and mob.submobjects:
+                for sub in mob.submobjects:
+                    _force_fill(sub, color)
+
+        _force_fill(new_text, original_color)
+
+    # 步骤 5: 替换
+    text_obj.become(new_text)
+    return True
 
     def _wrap_math_object(self, math_obj: MathTex, target_width: float) -> bool:
         """对 MathTex 对象执行换行重建（修复 P0-A）
