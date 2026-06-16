@@ -1,4 +1,4 @@
-<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/19336ef0-f97c-47f8-98dc-f367d0f7e236" />
+<img width="640" height="360" alt="image" src="https://github.com/user-attachments/assets/19336ef0-f97c-47f8-98dc-f367d0f7e236" />
 
 # ManimAnimationGenerator 技能包
 
